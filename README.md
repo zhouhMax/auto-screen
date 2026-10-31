@@ -51,6 +51,24 @@ GitHub Actions (09:15 / 14:35 / 15:35 触发)
 - 止盈价、止损价（按策略预设百分比）
 - 持有期
 
+## 云端结果回填（仓库中转）
+
+云端无法直接写本地 Excel，因此走仓库中转：
+
+1. 云端运行 `python main.py --slot auto --json-out`，生成 `data/results/<日期>_<时段>.json`
+2. 同一工作流的“提交结果到仓库”步骤把该 JSON 提交回 `main` 分支（需 `contents: write`）
+3. 本地 `local_run.ps1` 每次启动先 `git fetch ssh` + `git merge --ff-only ssh/main`，再执行
+   `python sync_results.py`，把新 JSON 逐条回填到 `选股池-TR.xlsx`
+4. 回填按“日期 + 时段 + 股票代码”去重，重复执行不会产生重复行；云端与本地同一时段的结果也不会互相叠加
+
+手动补一次云端历史结果：
+
+```bash
+python sync_results.py
+```
+
+`data/results/*.json` 已在 `.gitignore` 中单独放行，其余 `data/*`（parquet、缓存）不提交。
+
 ## 部署步骤（GitHub Actions）
 
 1. 新建一个**私有**仓库（private 更稳妥，代码与选股结果不外泄）。

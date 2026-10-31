@@ -384,6 +384,8 @@ def main():
                     help="离线：用本地通达信日线最后一日当快照，不联网")
     ap.add_argument("--excel", action="store_true",
                     help="把结果回填到选股池-TR.xlsx（每日选股/精选池/优中选优/分析）")
+    ap.add_argument("--json-out", action="store_true",
+                    help="把结果写入 data/results/<日期>_<时段>.json，供云端提交后本地回填")
     args = ap.parse_args()
 
     now = now_cn()
@@ -442,6 +444,18 @@ def main():
                                         h["rank"], sector))
 
     msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy)
+    if args.json_out:
+        try:
+            import excel_log
+            payload = excel_log.build_payload(slot, picked, snap, now)
+            out_dir = os.path.join(DATA_DIR, "results")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, "%s_%s.json" % (payload["date"], slot))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=str)
+            log("结果已写入 %s" % path)
+        except Exception as e:
+            log("结果 JSON 写入失败：%s" % e)
     if args.excel:
         try:
             import excel_log

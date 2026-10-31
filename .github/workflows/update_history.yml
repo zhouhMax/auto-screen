@@ -29,7 +29,10 @@ jobs:
       - name: 恢复上一次缓存
         uses: actions/cache/restore@v4
         with:
-          path: data
+          path: |
+            data/hist.parquet
+            data/basic.parquet
+            data/meta.json
           key: hist-${{ github.run_id }}
           restore-keys: |
             hist-
@@ -41,7 +44,10 @@ jobs:
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: data
+          path: |
+            data/hist.parquet
+            data/basic.parquet
+            data/meta.json
           key: hist-${{ github.run_id }}
 
       - name: 上传数据快照（可选，便于排查）

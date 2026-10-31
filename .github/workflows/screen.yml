@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   screen:
@@ -40,7 +40,10 @@ jobs:
       - name: 恢复历史数据缓存
         uses: actions/cache/restore@v4
         with:
-          path: data
+          path: |
+            data/hist.parquet
+            data/basic.parquet
+            data/meta.json
           key: hist-${{ github.run_id }}
           restore-keys: |
             hist-
@@ -59,4 +62,12 @@ jobs:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
           WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
-        run: python main.py --slot "${{ github.event.inputs.slot || 'auto' }}"
+        run: python main.py --slot "${{ github.event.inputs.slot || 'auto' }}" --json-out
+
+      - name: 提交结果到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/results
+          git diff --cached --quiet || git commit -m "选股结果 $(date -u +'%Y%m%d %H:%M') UTC"
+          git push

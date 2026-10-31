@@ -198,64 +198,30 @@ def fill_returns(wb, hist, log=print):
         log("  回算涨幅 %d 个单元格" % total)
 
 
-def write(slot, picked, snap, hist, now=None, log=print):
-    """回填一次选股结果，返回追加行数。"""
+def build_payload(slot, picked, snap, now=None):
+    """构造待回填数据；云端 --json 与本地 write 共用同一份结构。"""
     now = now or M.now_cn()
     date_str = now.strftime("%Y%m%d")
     snap_map = snap.set_index("code").to_dict("index") if not snap.empty else {}
 
-    from openpyxl import load_workbook
-    if not os.path.exists(LOG_PATH):
-        raise RuntimeError("找不到表格：%s" % LOG_PATH)
-    wb = load_workbook(LOG_PATH)
-
-    if SHEET_ANALYSIS not in wb.sheetnames:
-        ws = wb.create_sheet(SHEET_ANALYSIS, index=wb.sheetnames.index(SHEET_DAILY) + 1)
-        ws.append(COL_ANALYSIS)
-        log("  新建工作表：%s" % SHEET_ANALYSIS)
-
     common = {h["code"]: _common(h, slot, date_str, snap_map) for h in picked}
     pool = [h for h in picked if h["rank"] <= 2]   # 策略前 2 进入精选池
     best = None
-    best_note = ""
     if pool:
         scored = [(_score(h, snap, snap_map), h) for h in pool]
         scored.sort(key=lambda x: x[0][0], reverse=True)
         best = scored[0][1]
         avg, strong, size, flow = scored[0][0][1]
         ind = best.get("industry") or "未分类"
-        best_note = ("板块热度：%s 均涨 %.2f%%，强势 %d/%d 家；资金代理 %.2f 亿·涨幅"
-                     % (ind, avg, strong, size, flow))
+        note = ("板块热度：%s 均涨 %.2f%%，强势 %d/%d 家；资金代理 %.2f 亿·涨幅"
+                % (ind, avg, strong, size, flow))
         if len(scored) > 1:
-            best_note += "；精选池共 %d 只，按热度+资金+量比取最优" % len(scored)
-        common[best["code"]]["备注"] = best_note
+            note += "；精选池共 %d 只，按热度+资金+量比取最优" % len(scored)
+        common[best["code"]]["备注"] = note
 
-    n = 0
-    ws_daily = wb[SHEET_DAILY]
-    seen = _existing(ws_daily)
-    rows = [common[h["code"]] for h in picked
-            if (str(date_str), _slot_text(slot), str(_code_int(h["code"]))) not in seen]
-    n += _write_rows(ws_daily, rows, log)
-
-    ws_pick = wb[SHEET_PICK]
-    seen = _existing(ws_pick)
-    rows = [common[h["code"]] for h in pool
-            if (str(date_str), _slot_text(slot), str(_code_int(h["code"]))) not in seen]
-    n += _write_rows(ws_pick, rows, log)
-
-    if best is not None:
-        ws_best = wb[SHEET_BEST]
-        seen = _existing(ws_best)
-        if (str(date_str), _slot_text(slot), str(_code_int(best["code"]))) not in seen:
-            n += _write_rows(ws_best, [common[best["code"]]], log)
-
-    ws_an = wb[SHEET_ANALYSIS]
-    seen = _existing(ws_an)
     best_code = best["code"] if best else ""
-    rows = []
+    analysis = []
     for h in picked:
-        if (str(date_str), _slot_text(slot), str(_code_int(h["code"]))) in seen:
-            continue
         r = dict(common[h["code"]])
         sid = h["sid"]
         r["策略止盈时间"] = "+%d%%" % M.TP[sid]
@@ -263,20 +229,71 @@ def write(slot, picked, snap, hist, now=None, log=print):
         r["按策略止盈涨幅"] = M.TP[sid] / 100.0
         r["是否在精选池"] = "是" if h["rank"] <= 2 else "否"
         r["是否在优中选优"] = "是" if h["code"] == best_code else "否"
-        rows.append(r)
-    n += _write_rows(ws_an, rows, log)
+        analysis.append(r)
 
-    fill_returns(wb, hist, log)
+    return {"date": date_str, "slot": slot, "sheets": {
+        SHEET_DAILY: [common[h["code"]] for h in picked],
+        SHEET_PICK: [common[h["code"]] for h in pool],
+        SHEET_BEST: [common[best["code"]]] if best else [],
+        SHEET_ANALYSIS: analysis,
+    }}
 
+
+def _apply(wb, payload, log):
+    date_str = str(payload.get("date"))
+    slot = payload.get("slot")
+    n = 0
+    for name in (SHEET_DAILY, SHEET_PICK, SHEET_BEST, SHEET_ANALYSIS):
+        rows = (payload.get("sheets") or {}).get(name) or []
+        if name not in wb.sheetnames:
+            if name != SHEET_ANALYSIS:
+                continue
+            ws = wb.create_sheet(name, index=wb.sheetnames.index(SHEET_DAILY) + 1)
+            ws.append(COL_ANALYSIS)
+            log("  新建工作表：%s" % name)
+        ws = wb[name]
+        seen = _existing(ws)
+        keep = [r for r in rows
+                if (date_str, _slot_text(slot), str(r.get("股票代码"))) not in seen]
+        n += _write_rows(ws, keep, log)
+    return n
+
+
+def _save(wb):
     tmp = LOG_PATH + ".tmp"
     for i in range(3):
         try:
             wb.save(tmp)
             os.replace(tmp, LOG_PATH)
-            break
+            return
         except PermissionError:
             if i == 2:
                 raise RuntimeError("表格被占用，请先在 Excel 中关闭 %s" % LOG_PATH)
             time.sleep(2)
+
+
+def write(slot, picked, snap, hist, now=None, log=print):
+    """回填一次选股结果，返回追加行数。"""
+    from openpyxl import load_workbook
+    if not os.path.exists(LOG_PATH):
+        raise RuntimeError("找不到表格：%s" % LOG_PATH)
+    wb = load_workbook(LOG_PATH)
+    n = _apply(wb, build_payload(slot, picked, snap, now), log)
+    fill_returns(wb, hist, log)
+    _save(wb)
     log("Excel 回填完成：%s（%d 行）" % (LOG_PATH, n))
+    return n
+
+
+def write_payload(payload, log=print):
+    """把云端产出的 JSON 结果回填到表格（自动去重）。"""
+    from openpyxl import load_workbook
+    if not os.path.exists(LOG_PATH):
+        raise RuntimeError("找不到表格：%s" % LOG_PATH)
+    wb = load_workbook(LOG_PATH)
+    n = _apply(wb, payload, log)
+    _save(wb)
+    if n:
+        log("云端结果回填：%s %s 时段 %s，%d 行"
+            % (payload.get("date"), payload.get("slot"), LOG_PATH, n))
     return n

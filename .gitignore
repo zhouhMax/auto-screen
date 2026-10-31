@@ -1,4 +1,6 @@
-data/
+data/*
+!data/results/
+!data/results/*.json
 __pycache__/
 *.pyc
 .venv/
