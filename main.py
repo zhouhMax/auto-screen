@@ -316,11 +316,8 @@ def screen(slot, hist, basic, snap):
 # ------------------------------------------------------------------ 推送
 def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None):
     now = now_cn()
-    mmdd = now.strftime("%m%d")
     per_strategy = per_strategy or {}
-    lines = ["## 【Trae CN】%s%s选股结果" % (mmdd, SLOT_NAME[slot]),
-             "",
-             "信号 %s｜扫描 %d 只｜候选 %d 只｜输出 %d 只%s"
+    lines = ["信号 %s｜扫描 %d 只｜候选 %d 只｜输出 %d 只%s"
              % (now.strftime("%H:%M:%S"), scanned, n_cands, len(picked),
                 "｜**延迟启动**" if late else ""),
              "历史数据截至 %s" % meta.get("last_date", "未知"), ""]
@@ -440,7 +437,7 @@ def main():
     if args.dry_run:
         log(msg)
         return 0
-    summary = "%s%s选股 %d 只" % (SLOT_NAME[slot], now.strftime("%m%d"), len(picked))
+    summary = "【Trae CN】%s%s选股结果" % (now.strftime("%m%d"), SLOT_NAME[slot])
     return push(msg, summary)
 
 
