@@ -1,0 +1,52 @@
+name: 更新历史数据
+
+on:
+  schedule:
+    - cron: "10 15 * * 1-5"   # UTC 15:10 = 北京 23:10，收盘数据已落定
+  workflow_dispatch:
+
+concurrency:
+  group: update-history
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 恢复上一次缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: hist-${{ github.run_id }}
+          restore-keys: |
+            hist-
+
+      - name: 拉取全市场日线
+        run: python main.py --slot update-history
+
+      - name: 上传缓存（供选股任务使用）
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data
+          key: hist-${{ github.run_id }}
+
+      - name: 上传数据快照（可选，便于排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: hist-${{ github.run_id }}
+          path: data
+          retention-days: 3
