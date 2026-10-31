@@ -33,9 +33,9 @@ SLOT_TIP = {
     "close": "次日开盘买；高开>3%等回踩分时均价线；P1 压到 3-5 只全买，不要排序。",
 }
 
-# 推送规则：总量 ≤6，每策略 ≤2，每板块 ≤2
-MAX_TOTAL = 6
-MAX_PER_STRATEGY = 2
+# 推送规则（2026-11-02 起）：总量 ≤9，每策略 ≤3，不限板块
+MAX_TOTAL = 9
+MAX_PER_STRATEGY = 3
 PRIORITY = {"auction": ["J2", "J3", "J1"], "tail": ["W1", "W2", "W3"],
             "close": ["P1", "P2", "P3"]}
 RANK_TEXT = {1: "强烈推荐", 2: "推荐", 3: "谨慎推荐"}
@@ -299,17 +299,7 @@ def screen(slot, hist, basic, snap):
     prio = PRIORITY[slot]
     cands.sort(key=lambda x: (prio.index(x["sid"]) if x["sid"] in prio else 99,
                               x["rank"]))
-    picked = []
-    sec_count = {}
-    for c in cands:
-        sec = (c.get("industry") or "").strip()
-        if sec and sec_count.get(sec, 0) >= 2:
-            continue
-        if sec:
-            sec_count[sec] = sec_count.get(sec, 0) + 1
-        picked.append(c)
-        if len(picked) >= MAX_TOTAL:
-            break
+    picked = cands[:MAX_TOTAL]
     return picked, len(rows), len(cands), per_strategy
 
 
@@ -390,6 +380,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--max-codes", type=int, default=0, help="仅更新前 N 只，用于调试")
+    ap.add_argument("--offline", action="store_true",
+                    help="离线：用本地通达信日线最后一日当快照，不联网")
+    ap.add_argument("--excel", action="store_true",
+                    help="把结果回填到选股池-TR.xlsx（每日选股/精选池/优中选优/分析）")
     args = ap.parse_args()
 
     now = now_cn()
@@ -415,11 +409,25 @@ def main():
     basic = attach_boards(load_basic())
 
     t0 = time.time()
-    log("时段：%s，开始拉取快照…" % slot)
-    fb = list(basic["code"]) if not basic.empty else None
-    snap = fetcher.fetch_snapshot(fallback_codes=fb)
-    if snap.empty:
-        raise RuntimeError("快照为空")
+    if args.offline:
+        import tdx
+        snap, hist = tdx.offline_frame(hist, basic)
+        log("离线模式：%d 只，信号价取本地日线 %s 收盘" % (len(snap), meta.get("last_date", "未知")))
+    else:
+        log("时段：%s，开始拉取快照…" % slot)
+        fb = list(basic["code"]) if not basic.empty else None
+        snap = fetcher.fetch_snapshot(fallback_codes=fb)
+        if snap.empty:
+            raise RuntimeError("快照为空")
+        today = now.strftime("%Y%m%d")
+        n_trim = 0
+        for code, h in hist.items():
+            if h["date"] and str(h["date"][-1]).replace("-", "") == today:
+                hist[code] = {"date": h["date"][:-1],
+                              **{k: v[:-1] for k, v in h.items() if k != "date"}}
+                n_trim += 1
+        if n_trim:
+            log("日线已含今日，剔除 %d 只的当日 K 线以避免重复计价" % n_trim)
     snap = attach_boards(snap)
     if snap["circ_mv"].isna().all() or (snap["circ_mv"] == 0).all():
         log("快照缺少流通市值，改用本地基础数据补算（新浪备用源）")
@@ -434,6 +442,12 @@ def main():
                                         h["rank"], sector))
 
     msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy)
+    if args.excel:
+        try:
+            import excel_log
+            excel_log.write(slot, picked, snap, hist, now, log)
+        except Exception as e:
+            log("Excel 回填失败：%s" % e)
     if args.dry_run:
         log(msg)
         return 0
