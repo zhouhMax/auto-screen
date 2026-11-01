@@ -205,10 +205,12 @@ def build_payload(slot, picked, snap, now=None):
     snap_map = snap.set_index("code").to_dict("index") if not snap.empty else {}
 
     common = {h["code"]: _common(h, slot, date_str, snap_map) for h in picked}
-    pool = [h for h in picked if h["rank"] <= 2]   # 策略前 2 进入精选池
+    pool = [h for h in picked if h["rank"] <= 3]   # 每策略前 3 进入精选池
     best = None
     if pool:
-        scored = [(_score(h, snap, snap_map), h) for h in pool]
+        # 优中选优：优先在排名 2、3 中挑，无此类时再退回排名 1
+        pref = [h for h in pool if h["rank"] >= 2] or [h for h in pool if h["rank"] == 1]
+        scored = [(_score(h, snap, snap_map), h) for h in pref]
         scored.sort(key=lambda x: x[0][0], reverse=True)
         best = scored[0][1]
         avg, strong, size, flow = scored[0][0][1]
@@ -216,7 +218,9 @@ def build_payload(slot, picked, snap, now=None):
         note = ("板块热度：%s 均涨 %.2f%%，强势 %d/%d 家；资金代理 %.2f 亿·涨幅"
                 % (ind, avg, strong, size, flow))
         if len(scored) > 1:
-            note += "；精选池共 %d 只，按热度+资金+量比取最优" % len(scored)
+            note += "；精选池共 %d 只，按热度+资金+量比取最优" % len(pool)
+        if best["rank"] >= 2:
+            note += "；优先从排名 2、3 中选取"
         common[best["code"]]["备注"] = note
 
     best_code = best["code"] if best else ""
@@ -227,7 +231,7 @@ def build_payload(slot, picked, snap, now=None):
         r["策略止盈时间"] = "+%d%%" % M.TP[sid]
         r["策略卖出价格"] = round(_base(h, slot) * (1 + M.TP[sid] / 100.0), 2)
         r["按策略止盈涨幅"] = M.TP[sid] / 100.0
-        r["是否在精选池"] = "是" if h["rank"] <= 2 else "否"
+        r["是否在精选池"] = "是" if h["rank"] <= 3 else "否"
         r["是否在优中选优"] = "是" if h["code"] == best_code else "否"
         analysis.append(r)
 
