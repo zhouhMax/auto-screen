@@ -40,8 +40,9 @@ def _slot_text(slot):
     return SLOT_TEXT.get(slot, slot)
 
 
-def _code_int(code):
-    return int(code) if str(code).isdigit() else str(code)
+def _code_text(code):
+    """股票代码一律 6 位文本，防止 Excel 吃掉深市前导零（000001->1）。"""
+    return str(code).split(".")[0].strip().zfill(6)
 
 
 def _sector(h):
@@ -72,7 +73,7 @@ def _common(h, slot, date_str, snap_map):
               "策略内第 %d 名。" % (h["name"], code, sid, _sector(h), amt / 1e8, vr, to, h["rank"]))
     return {
         "选股日期": int(date_str),
-        "股票代码": _code_int(code),
+        "股票代码": _code_text(code),
         "股票名称": h["name"],
         "所属板块": _sector(h),
         "板块": (h.get("industry") or "未分类"),
@@ -131,7 +132,11 @@ def _write_rows(ws, rows, log):
     for i, data in enumerate(rows):
         vals = [data.get(str(h).strip(), None) if h is not None else None for h in header]
         for j, v in enumerate(vals, start=1):
-            ws.cell(row=start + i, column=j).value = v
+            cell = ws.cell(row=start + i, column=j)
+            if str(header[j - 1]).strip() == "股票代码" and v is not None:
+                v = _code_text(v)
+                cell.number_format = "@"
+            cell.value = v
     if rows:
         log("  %s +%d 行（自第 %d 行）" % (ws.title, len(rows), start))
     return len(rows)
@@ -150,7 +155,8 @@ def _existing(ws):
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row[i_d] is None:
             continue
-        out.add((str(row[i_d]), str(row[i_s] or ""), str(row[i_c])))
+        code = _code_text(row[i_c]) if row[i_c] is not None else ""
+        out.add((str(row[i_d]), str(row[i_s] or ""), code))
     return out
 
 
@@ -258,7 +264,7 @@ def _apply(wb, payload, log):
         ws = wb[name]
         seen = _existing(ws)
         keep = [r for r in rows
-                if (date_str, _slot_text(slot), str(r.get("股票代码"))) not in seen]
+                if (date_str, _slot_text(slot), _code_text(r.get("股票代码"))) not in seen]
         n += _write_rows(ws, keep, log)
     return n
 
