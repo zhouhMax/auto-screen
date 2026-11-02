@@ -26,11 +26,7 @@ $log = Join-Path $root ("logs\run_" + $Slot + "_" + (Get-Date -Format "yyyyMMdd"
     Out-File $log -Append -Encoding utf8
 
 # 先拉取云端提交的选股结果（data/results），再回填表格
-$git = "D:\Program Files\Git\cmd\git.exe"
-if (Test-Path $git) {
-    & $git fetch ssh --quiet 2>&1 | Out-File $log -Append -Encoding utf8
-    & $git merge --ff-only ssh/main --quiet 2>&1 | Out-File $log -Append -Encoding utf8
-}
+python sync_cloud.py 2>&1 | Out-File $log -Append -Encoding utf8
 python sync_results.py 2>&1 | Out-File $log -Append -Encoding utf8
 
 # 用本地通达信日线刷新历史缓存，再选股回填
