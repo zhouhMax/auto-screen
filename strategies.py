@@ -45,6 +45,39 @@ def _base(t, h):
 
 
 # ---------------------------------------------------------------- 竞价 9:25
+def ev_a3(t, h):
+    """A3 竞价·N字反包：前日涨停 -> 昨日收阴洗盘未破中位 -> 今日竞价高开反包。
+
+    参数（公式默认）：N1=昨日成交额≥5亿 N2/N3=流通市值50-800亿
+    N4/N5=高开0.5%-6% N6=昨日量比≥2.5（0=不启用）
+    """
+    if len(h["close"]) < 23:
+        return None
+    b = _base(t, h)
+    prev, o = b["pc"], b["o"]
+    if prev <= 0 or o <= 0:
+        return None
+    c2, c3 = float(h["close"][-2]), float(h["close"][-3])
+    o1, c1 = float(h["open"][-1]), float(h["close"][-1])
+    lo1 = float(h["low"][-1])
+    mid = (float(h["open"][-2]) + c2) / 2.0
+    amt1 = float(h["amount"][-1]) / 1e8
+    fmv = b["mv"] / 1e8
+    gap = (o / prev - 1) * 100
+    vr1 = float(h["volume"][-1]) / float(np.mean(h["volume"][-20:]))
+    if c2 < c3 * b["z"] * 0.995:               # 前日涨停
+        return None
+    if not (o1 > c1 and lo1 >= mid):           # 昨日收阴洗盘且最低不破前日中位
+        return None
+    if amt1 < 5 or not (50 <= fmv <= 800):     # 昨日成交额 / 流通市值
+        return None
+    if not (0.5 <= gap <= 6):                  # 今日竞价高开区间
+        return None
+    if vr1 < 2.5:                              # 昨日量比（历史口径，非实时量比列）
+        return None
+    return {"gap": gap, "amt1": amt1, "mv": fmv, "price": o}
+
+
 def ev_j1(t, h):
     b = _base(t, h)
     pc, o = b["pc"], b["o"]
@@ -223,6 +256,8 @@ def ev_p3(t, h):
 
 
 STRATEGIES = {
+    "A3": dict(func=ev_a3, name="竞价·N字反包", slot="auction",
+               sort="gap", desc="按高开幅度降序，取前 3；低频补位，优先级最低"),
     "J1": dict(func=ev_j1, name="竞价·温和抢筹", slot="auction",
                sort="gap", desc="按高开幅度降序，取前 3"),
     "J2": dict(func=ev_j2, name="竞价·炸板弱转强", slot="auction",
@@ -241,4 +276,7 @@ STRATEGIES = {
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
     "P3": dict(func=ev_p3, name="盘后·均线粘合", slot="close",
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
+    # C1 与 W3（尾盘·首板打板）判定同源；C1 为盘后收盘确认版（15:30 后以收盘价复核）
+    "C1": dict(func=ev_w3, name="盘后·首板确认", slot="close",
+               sort="mv", desc="按流通市值降序，取前 5"),
 }
