@@ -31,9 +31,11 @@ def market_of(code):
     return "bj"
 
 
-def read_day(code, lmt=LMT):
-    """读取单只股票最近 lmt 根日线，返回 dict 或 None。"""
-    p = os.path.join(ROOT, market_of(code), "lday", "%s%s.day" % (market_of(code), code))
+def read_day(code, lmt=LMT, mkt=None):
+    """读取单只股票最近 lmt 根日线，返回 dict 或 None。
+    mkt：显式指定市场（"sh"/"sz"/"bj"），用于指数等非股票代码（如 sh000001）。"""
+    mk = mkt or market_of(code)
+    p = os.path.join(ROOT, mk, "lday", "%s%s.day" % (mk, code))
     if not os.path.exists(p):
         return None
     n = os.path.getsize(p) // REC

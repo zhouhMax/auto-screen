@@ -277,6 +277,116 @@ def ev_p3(t, h):
     return {"gap": zf, "spread": (spread - 1) * 100, "mv": fmv, "price": c}
 
 
+# ------------------------------------------------- F13 底部首阳D8（独立函数，未上注册表）
+# 【2026-11-03 回测口径】5011 只 / 2024-06-10~2026-10-30 / 信号日收盘确认→次日开买→hold10 收盘卖。
+#   全信号口径：全期 n=1548 胜53.9% 均+2.62% | 内 n=504 -0.85% | 外 n=1044 +4.30%（同期全市场基准 外 -0.89%）。
+#   部署口径（每日按流通市值升序截 3）：内 +1.01% / 外 +2.48%，样本外唯一为正的 F13 部署形态。
+# 【择时开关回测结论：证据不足，不启用（enabled 默认 False）】
+#   ① 指数趋势类全部反向：上证/沪深300 C>MA20、C>MA60、MA20>MA60、连续5/10日、20日动量>0
+#      的开关版本样本外均大幅劣于基线（F13 是超跌首阳，天然在指数弱势段触发，趋势开关方向相反）。
+#   ② 唯一双优候选"全市场站上MA20占比>0.40"（开58%天数）：全信号口径内 -0.85%→+0.84%、
+#      外 +4.30%→+4.65%；但 bootstrap 90%CI [-1.15, +2.37] 跨零不显著；且部署口径（每日截3）
+#      样本外反而 +2.48%→+1.75%（CI [-7.74, +3.17]），两口径样本外结论相反。
+#   ③ 波动/回撤类（20日振幅、距60日高点回撤<5/8/10%）样本外无稳定增益。
+#   按判定规则（样本外不劣于基线才启用）→ 不启用；参数与逻辑保留在 F13_TIMING/gate 供日后重测，
+#   启用方式：F13_TIMING["enabled"]=True（手动总开关，随时可整体回到纯 F13）。
+F13_TIMING = {
+    "enabled": False,        # 手动总开关：False=纯 F13（不择时）
+    "kind": "breadth_ma20",  # breadth_ma20=全市场站上MA20占比 | index_ma20=指数收盘>MA20
+    "th": 0.40,              # breadth_ma20 阈值（回测扫描 0.40~0.55 平台，0.40 为下沿）
+    "index_code": "000001",  # index_ma20 用指数（配合 index_mkt）
+    "index_mkt": "sh",       # sh000001 上证；可换 sh000300 沪深300
+    "on_missing": "pass",    # 数据缺失默认放行：回测显示择时无显著增益、阻断无价值，
+                             # 放行可避免因指数文件/宽度数据问题静默空仓错失信号
+}
+
+
+def f13_breadth_ma20(closes):
+    """全市场站上MA20占比（gate 的 breadth_ma20 数据源）。
+    closes：每只股票含今日收盘的一维序列（长度>=20），可传生成器。
+    少于 20 根或含非正值的股票跳过；全市场无有效样本时返回 None（gate 按缺失处理）。"""
+    up = tot = 0
+    for a in closes:
+        a = np.asarray(a, dtype=float)
+        if len(a) < 20:
+            continue
+        a = a[-20:]
+        if a[-1] <= 0 or not np.isfinite(a).all():
+            continue
+        tot += 1
+        up += a[-1] > a.mean()
+    return up / tot if tot else None
+
+
+def gate_f13_timing(breadth=None, index_close=None, timing=None):
+    """F13 择时闸门。返回 (放行bool, 原因str)，原因 ∈ off/gate/missing。
+    因果性：所有判定只用信号日（盘后收盘）当时可得的数据，无未来函数。
+      - breadth：f13_breadth_ma20() 的当日全市场统计（盘后扫描全市场时顺带可算）
+      - index_close：指数含今日收盘序列（>=20 根；可由 tdx.read_day(index_code, mkt=index_mkt) 取）
+    缺失/异常时按 F13_TIMING["on_missing"]：pass=放行（默认，理由见上）/ block=阻断。"""
+    T = dict(F13_TIMING, **(timing or {}))
+    if not T["enabled"]:
+        return True, "off"
+    try:
+        if T["kind"] == "breadth_ma20":
+            if breadth is None:
+                raise ValueError("breadth 数据缺失")
+            ok = breadth > T["th"]
+        elif T["kind"] == "index_ma20":
+            a = np.asarray(index_close, dtype=float)
+            if len(a) < 20 or a[-1] <= 0:
+                raise ValueError("指数数据缺失")
+            ok = a[-1] > a[-20:].mean()
+        else:
+            raise ValueError("未知 kind: %s" % T["kind"])
+    except Exception:
+        return T["on_missing"] != "block", "missing"
+    return bool(ok), "gate"
+
+
+def ev_f13(t, h):
+    """F13 底部首阳D8：60日深跌池内缩量阴跌后的放量首阳（超跌反抽）。
+    回测口径直译，独立函数未上注册表；实盘部署时需先重测样本外。
+    条件（dk：30/68 开头 0.20，4/8/92 开头 0.30，其余 0.10）：
+      非ST · 近60日（含今日）无单日跌幅>dk+1% · 今收<60日最高收×0.7 · 今收<MA60
+      · 今量>30日最高量×0.8 · 今量>5日均量 且 昨量>昨日5日均量
+      · 20日涨幅<15% · 收阳（今收>昨收）且涨幅>2% · 成交额>5000万 · 上市满250根"""
+    if len(h["close"]) < 250:
+        return None
+    b = _base(t, h)
+    c, v, pc = b["c"], b["v"], b["pc"]
+    if c <= 0 or pc <= 0 or v <= 0:
+        return None
+    nm = str(t.get("name", "")).upper()
+    if "ST" in nm or "*" in nm:
+        return None
+    code = t["code"]
+    if code[:2] in ("30", "68"):
+        dk = 0.20
+    elif code[:1] in ("4", "8") or code[:2] == "92":
+        dk = 0.30
+    else:
+        dk = 0.10
+    hc = np.asarray(h["close"], dtype=float)
+    hv = np.asarray(h["volume"], dtype=float)
+    rc = np.concatenate([hc[-59:] / hc[-60:-1] - 1, [c / pc - 1]])
+    if (rc < -dk - 0.01).any():
+        return None
+    hhc60 = max(hc[-59:].max(), c)
+    ma60 = (hc[-59:].sum() + c) / 60.0
+    hhv30 = max(hv[-29:].max(), v)
+    vma5 = (hv[-4:].sum() + v) / 5.0
+    if not (c < hhc60 * 0.7 and c < ma60):
+        return None
+    if not (v > hhv30 * 0.8 and v > vma5 and hv[-1] > hv[-5:].mean()):
+        return None
+    if not (c / hc[-20] - 1 < 0.15 and c > pc and (c / pc - 1) * 100 > 2.0):
+        return None
+    if b["amt"] <= 5e7:
+        return None
+    return {"gap": (c / pc - 1) * 100, "mv": b["mv"] / 1e8, "price": c}
+
+
 STRATEGIES = {
     "A3": dict(func=ev_a3, name="竞价·N字反包", slot="auction",
                sort="gap", desc="按高开幅度降序，取前 3；低频补位，优先级最低"),
