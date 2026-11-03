@@ -175,7 +175,8 @@ def ev_w2(t, h):
             "mv": fmv, "price": b["c"]}
 
 
-def ev_w3(t, h):
+def _ev_first_board(t, h, lo, hi):
+    """首板打板判定（W3/C1 共用）：流通市值限定在 [lo, hi] 亿。"""
     if len(h["close"]) < 2:
         return None
     b = _base(t, h)
@@ -185,10 +186,20 @@ def ev_w3(t, h):
     kegou = b["h"] > b["l"] * 1.001
     amt = b["amt"] / 1e8
     fmv = b["mv"] / 1e8
-    if not (zt and not prev_zt and kegou and amt >= 3 and 200 <= fmv <= 800):
+    if not (zt and not prev_zt and kegou and amt >= 3 and lo <= fmv <= hi):
         return None
     return {"gap": (b["c"] / b["pc"] - 1) * 100 if b["pc"] else 0,
             "mv": fmv, "amt": amt, "price": b["c"]}
+
+
+def ev_w3(t, h):
+    """W3 尾盘·首板打板：流通市值 200-400 亿段（与 C1 的 400-800 亿互补不重叠）。"""
+    return _ev_first_board(t, h, 200, 400)
+
+
+def ev_c1(t, h):
+    """C1 尾盘·首板确认：判定与 W3 同源，市值段 400-800 亿（独立票池）。"""
+    return _ev_first_board(t, h, 400, 800)
 
 
 # ---------------------------------------------------------------- 盘后 15:40
@@ -276,8 +287,8 @@ STRATEGIES = {
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
     "P3": dict(func=ev_p3, name="盘后·均线粘合", slot="close",
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
-    # C1 与 W3（尾盘·首板打板）判定同源；同处尾盘时段，经 screen() 代码级去重后
-    # 仅当 W3 未选中该股时才会补位出现（实际为收盘确认口径的冗余备份位）
-    "C1": dict(func=ev_w3, name="尾盘·首板确认", slot="tail",
-               sort="mv", desc="按流通市值降序，取前 5；与 W3 同源，时段内去重"),
+    # C1 与 W3 判定同源但市值段互补（W3=200-400 亿、C1=400-800 亿），互不重叠、
+    # 各出各票；screen() 的时段内代码级去重保留作兜底（W1/W2 等仍可能同票）
+    "C1": dict(func=ev_c1, name="尾盘·首板确认", slot="tail",
+               sort="mv", desc="按流通市值降序，取前 5；市值段 400-800 亿，与 W3 互补"),
 }

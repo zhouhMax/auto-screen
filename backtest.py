@@ -53,18 +53,19 @@ def load_universe():
     return uni
 
 
-def precompute(u):
+def precompute(code, u):
     """每只股票预计算与参数无关的特征数组。"""
     o, c, hi, lo = u["open"], u["close"], u["high"], u["low"]
     v, amt = u["volume"], u["amount"]
     n = len(c)
-    z = ztl("", u["name"])          # ST 由当前简称判定（口径说明见文件头）
+    z = ztl(code, u["name"])        # 涨停幅按代码前缀判（300/301/688=20cm），修正旧版仅按简称判的口径
     feat = {"z": z}
 
     # --- A3 特征（i 为信号日"今日"，条件全部用 i-1 及更早 + 当日开盘）---
     if n > 22:
         zt2 = np.zeros(n, bool)
-        zt2[3:] = c[2:-1] >= c[1:-2] * z * 0.995
+        # zt2[k] = c[k-2] >= c[k-3]*z*0.995，即"前日涨停"（与 ev_a3 的 h[-2]/h[-3] 对齐）
+        zt2[3:] = c[1:-2] >= c[:-3] * z * 0.995
         yin = np.zeros(n, bool)
         yin[2:] = o[1:-1] > c[1:-1]
         mid = np.full(n, np.nan)
@@ -191,6 +192,8 @@ def cap_by_day(trades, key, top, rev=True):
 
 def split_io(trades):
     """按信号日期 70/30 切分样本内/外。"""
+    if not trades:
+        return [], []
     ds = sorted({t["date"] for t in trades})
     cut = ds[int(len(ds) * IN_RATIO)]
     return [t for t in trades if t["date"] < cut], [t for t in trades if t["date"] >= cut]
@@ -216,7 +219,7 @@ def main():
         % (len(uni), min(u["date"][0] for u in uni.values()),
            max(u["date"][-1] for u in uni.values())))
     log("预计算特征…")
-    feats = {c: precompute(u) for c, u in uni.items()}
+    feats = {c: precompute(c, u) for c, u in uni.items()}
 
     # ---------- A3 基线 ----------
     base_a3 = scan_a3(uni, feats, A3)
