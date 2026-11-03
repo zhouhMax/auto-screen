@@ -276,7 +276,8 @@ STRATEGIES = {
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
     "P3": dict(func=ev_p3, name="盘后·均线粘合", slot="close",
                sort="gap", desc="按涨幅降序，取前 5；同行业只留 1 只"),
-    # C1 与 W3（尾盘·首板打板）判定同源；C1 为盘后收盘确认版（15:30 后以收盘价复核）
-    "C1": dict(func=ev_w3, name="盘后·首板确认", slot="close",
-               sort="mv", desc="按流通市值降序，取前 5"),
+    # C1 与 W3（尾盘·首板打板）判定同源；同处尾盘时段，经 screen() 代码级去重后
+    # 仅当 W3 未选中该股时才会补位出现（实际为收盘确认口径的冗余备份位）
+    "C1": dict(func=ev_w3, name="尾盘·首板确认", slot="tail",
+               sort="mv", desc="按流通市值降序，取前 5；与 W3 同源，时段内去重"),
 }
