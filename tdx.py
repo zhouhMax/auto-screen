@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 HIST_PATH = os.path.join(DATA_DIR, "hist.parquet")
 BASIC_PATH = os.path.join(DATA_DIR, "basic.parquet")
-LMT = 160
+LMT = 300   # F13（盘后）需 250 根历史，160 不够；backtest.py 自用 520 不受影响
 REC = 32
 
 

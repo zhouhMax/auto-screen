@@ -60,6 +60,16 @@ def _buy_time(slot):
             "close": "次日开盘买入"}.get(slot, "现价")
 
 
+def _tpsl_text(sid):
+    """TP/SL 禁用语义：None = 不设（F13 回测任何 TP/SL 均降低收益）。"""
+    tp, sl = M.TP[sid], M.SL[sid]
+    if tp is None or sl is None:
+        return "不设", "不设止盈止损（回测：任何 TP/SL 都显著降低收益）"
+    return ("+%d%% / -%s%%" % (tp, ("%.1f" % sl).rstrip("0").rstrip(".")),
+            "%s：+%d%% 止盈，-%s%% 止损" % (M.STRATEGIES[sid]["name"], tp,
+                                           ("%.1f" % sl).rstrip("0").rstrip(".")))
+
+
 def _common(h, slot, date_str, snap_map):
     sid = h["sid"]
     code = h["code"]
@@ -86,10 +96,9 @@ def _common(h, slot, date_str, snap_map):
         "槽位分配(比例)": "%.1f%%" % (100.0 / M.MAX_TOTAL),
         "计划持股时间": M.HOLD[sid],
         "持股时间": M.HOLD[sid],
-        "计划止盈时间": "+%d%%" % M.TP[sid],
-        "计划止损时间": "-%s%%" % ("%.1f" % M.SL[sid]).rstrip("0").rstrip("."),
-        "卖出建议": "%s：+%d%% 止盈，-%s%% 止损"
-                % (st, M.TP[sid], ("%.1f" % M.SL[sid]).rstrip("0").rstrip(".")),
+        "计划止盈时间": _tpsl_text(sid)[0].split(" / ")[0],
+        "计划止损时间": _tpsl_text(sid)[0].split(" / ")[-1],
+        "卖出建议": _tpsl_text(sid)[1],
         "策略内排名": "%s第%d名" % (st, h["rank"]),
         "推荐程度": M.RANK_TEXT.get(h["rank"], "谨慎推荐"),
         "推荐理由": reason,
@@ -234,9 +243,14 @@ def build_payload(slot, picked, snap, now=None):
     for h in picked:
         r = dict(common[h["code"]])
         sid = h["sid"]
-        r["策略止盈时间"] = "+%d%%" % M.TP[sid]
-        r["策略卖出价格"] = round(_base(h, slot) * (1 + M.TP[sid] / 100.0), 2)
-        r["按策略止盈涨幅"] = M.TP[sid] / 100.0
+        if M.TP[sid] is None:            # 不设止盈：留空，不显示误导性的 +0%
+            r["策略止盈时间"] = "不设"
+            r["策略卖出价格"] = ""
+            r["按策略止盈涨幅"] = ""
+        else:
+            r["策略止盈时间"] = "+%d%%" % M.TP[sid]
+            r["策略卖出价格"] = round(_base(h, slot) * (1 + M.TP[sid] / 100.0), 2)
+            r["按策略止盈涨幅"] = M.TP[sid] / 100.0
         r["是否在精选池"] = "是" if h["rank"] <= 3 else "否"
         r["是否在优中选优"] = "是" if h["code"] == best_code else "否"
         analysis.append(r)

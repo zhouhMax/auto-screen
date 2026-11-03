@@ -30,16 +30,16 @@ SLOT_NAME = {"auction": "早盘", "tail": "尾盘", "close": "盘后"}
 SLOT_TIP = {
     "auction": "9:30 开盘后 1-3 分钟内买入，不挂低价等回踩；止损：J1 开盘价-1.5%，J2 昨日最低，J3 -3%。",
     "tail": "14:45 后确认股价在分时均价线上方再买；W1 隔夜，次日冲高 +3%~+5% 分批；W3 打板以涨停价挂单，14:57 未封板放弃。",
-    "close": "（盘后时段已停用 2026-11-03，P1 待替换策略后恢复本提示）",
+    "close": "F13 盘后收盘确认信号，次日开盘买入，持 10 个交易日；不设止盈止损（回测：任何 TP/SL 都显著降低收益），按市值升序取前 3，弱市月可能连续亏损，属行情依赖型策略。",
 }
 
 # 推送规则（2026-11-02 起）：总量 ≤9，每策略 ≤3，不限板块
-# （2026-11-03 下线 W2/P2/P3；同日盘后时段整体停用（P1 待替换策略），
-#   实际构成：竞价 J1/J2/J3/A3、尾盘 W1/W3/C1；输出条数按当日实际命中自适应）
+# （2026-11-03 下线 W2/P2/P3 并停用盘后时段；同日 F13 上线恢复盘后时段，
+#   实际构成：竞价 J1/J2/J3/A3、尾盘 W1/W3/C1、盘后 F13；输出条数按当日实际命中自适应）
 MAX_TOTAL = 9
 MAX_PER_STRATEGY = 3
 PRIORITY = {"auction": ["J2", "J3", "J1", "A3"], "tail": ["W1", "W3", "C1"],
-            "close": []}   # 盘后时段已停用（2026-11-03），待替换策略
+            "close": ["F13"]}
 RANK_TEXT = {1: "强烈推荐", 2: "推荐", 3: "谨慎推荐"}
 
 # 策略逻辑、止盈/止损、持有期
@@ -51,14 +51,16 @@ REASON = {
     "W3": "今日首板涨停且封板过程有炸板（非一字），成交额 ≥3 亿、流通市值 200-400 亿（中盘段，与 C1 市值互补）",
     "A3": "前日涨停→昨日收阴洗盘未破前日中位→今日竞价高开 0.5%-6% 反包；昨日量比 ≥2.5、成交额 ≥5 亿、流通市值 50-800 亿（低频，月均不足 1 笔）",
     "C1": "尾盘确认首板涨停（昨日未涨停）、非一字可买、成交额 ≥3 亿、流通市值 400-800 亿（与 W3 的 200-400 亿市值互补，独立票池各出各票）；涨停价打板买入后按公式持有 10 个交易日（区别于 W3 的次日冲高即走）",
+    "F13": "60 日深跌池内（近 60 日无单日大跌、收盘低于 60 日高点 30% 以上且在 60 日线下方）缩量阴跌后的放量首阳；次日开盘买入，持 10 个交易日。按流通市值升序取前 3（回测唯一样本外为正的截取口径）",
 }
 TP = {"J1": 5, "J2": 8, "J3": 6, "W1": 5, "W3": 5,
-      "A3": 6, "C1": 15}
+      "A3": 6, "C1": 15, "F13": None}
 SL = {"J1": 2.5, "J2": 4, "J3": 4, "W1": 3, "W3": 5,
-      "A3": 4, "C1": 8}
+      "A3": 4, "C1": 8, "F13": None}
 HOLD = {"J1": "1-3 个交易日", "J2": "1-3 个交易日", "J3": "1-3 个交易日",
         "W1": "次日为主，最长 3 日", "W3": "次日冲高即走",
-        "A3": "2 个交易日（公式口径）", "C1": "10 个交易日（公式口径，打板买入起算）"}
+        "A3": "2 个交易日（公式口径）", "C1": "10 个交易日（公式口径，打板买入起算）",
+        "F13": "10 个交易日（次日开盘买入起算；回测 hold15 同样可行，统一取 10）"}
 BUY_RANGE = {"auction": (0.995, 1.015), "tail": (0.99, 1.01), "close": (0.99, 1.025)}
 
 
@@ -206,7 +208,8 @@ def update_history(max_codes=0):
 
     codes = list(basic["code"])
     log("拉取 %d 只个股日线（约 2-8 分钟）…" % len(codes))
-    hist = fetcher.fetch_history(codes, workers=16, lmt=160, log=log)
+    # lmt=300：F13（盘后）需 250 根历史（上市满 250 日 + 60/30 日窗口），160 根不够
+    hist = fetcher.fetch_history(codes, workers=16, lmt=300, log=log)
     if hist.empty:
         raise RuntimeError("日线为空，无法更新")
     _save_parquet(hist, HIST_PATH)
@@ -290,7 +293,9 @@ def screen(slot, hist, basic, snap):
                 hits.append(item)
         key = cfg.get("sort")
         if key:                             # sort=None 的策略不排序，按触发顺序
-            rev = not (sid == "J3")        # J3 按昨成交额升序，其余降序
+            # 升序策略：J3 按昨成交额升序（越冷门越优先）、F13 按流通市值升序
+            # （回测唯一样本外为正的截取口径，见 strategies.py F13 注册注释）；其余降序
+            rev = sid not in ("J3", "F13")
             hits.sort(key=lambda x: x.get(key, 0) or 0, reverse=rev)
         hits = hits[:MAX_PER_STRATEGY]
         for i, h in enumerate(hits):
@@ -331,8 +336,8 @@ def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None)
         sid = h["sid"]
         base = float(h.get(base_key) or h["price"])
         lo, hi = base * lo_k, base * hi_k
-        tp = base * (1 + TP[sid] / 100.0)
-        sl = base * (1 - SL[sid] / 100.0)
+        tp = base * (1 + TP[sid] / 100.0) if TP[sid] is not None else None
+        sl = base * (1 - SL[sid] / 100.0) if SL[sid] is not None else None
         sec = h.get("industry") or "未分类"
         con = (h.get("concept") or "").strip()
         sector = sec + ("｜" + con if con else "")
@@ -342,8 +347,10 @@ def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None)
             "- 板块：%s" % sector,
             "- 逻辑：%s" % REASON[sid],
             "- 买入区间：%.2f - %.2f" % (lo, hi),
-            "- 止盈 %.2f（+%d%%）｜止损 %.2f（-%s%%）"
-            % (tp, TP[sid], sl, ("%.1f" % SL[sid]).rstrip("0").rstrip(".")),
+            ("- 不设止盈止损（回测：任何 TP/SL 都显著降低收益）"
+             if TP[sid] is None or SL[sid] is None else
+             "- 止盈 %.2f（+%d%%）｜止损 %.2f（-%s%%）"
+             % (tp, TP[sid], sl, ("%.1f" % SL[sid]).rstrip("0").rstrip("."))),
             "- 持有期：%s" % HOLD[sid],
             "",
         ]
@@ -406,8 +413,7 @@ def main():
         update_history(args.max_codes)
         return 0
     if not any(cfg["slot"] == slot for cfg in STRATEGIES.values()):
-        log("%s时段已停用（2026-11-03，无注册策略，待替换策略），"
-            "跳过选股/推送/回填；历史与日线数据更新不受影响。"
+        log("%s时段无注册策略，跳过选股/推送/回填；历史与日线数据更新不受影响。"
             % SLOT_NAME.get(slot, slot))
         return 0
 
@@ -425,6 +431,11 @@ def main():
     late = wait_for(slot, enabled=not args.no_wait)
 
     hist = load_hist()
+    if slot == "close" and hist:
+        nmax = max(len(h["close"]) for h in hist.values())
+        if nmax < 251:
+            log("警告：历史数据仅 %d 根（<251），F13 无法产生信号，请先重跑 "
+                "--slot update-history（2026-11-03 起 lmt 提升为 300）" % nmax)
     basic = attach_boards(load_basic())
 
     t0 = time.time()
