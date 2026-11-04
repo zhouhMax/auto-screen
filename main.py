@@ -364,6 +364,14 @@ def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None)
     return "\n".join(lines)
 
 
+def push_title(slot, dt=None):
+    """推送标题：`【Trae CN】MMDD早盘/尾盘/盘后选股`（例：`【Trae CN】1104早盘选股`）。
+    本地 main.py 与云端 Actions（同一脚本）共用此函数，避免两通道标题不一致。
+    MMDD 取当天日期并补零两位；标题最长 17 字（WxPusher summary 上限 20 字，无需截断）。"""
+    dt = dt or now_cn()
+    return "【Trae CN】%s%s选股" % (dt.strftime("%m%d"), SLOT_NAME[slot])
+
+
 def push(content, summary):
     token = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
     uids = [x.strip() for x in os.environ.get("WXPUSHER_UIDS", "").split(",") if x.strip()]
@@ -493,7 +501,7 @@ def main():
     if args.dry_run:
         log(msg)
         return 0
-    summary = "【Trae CN】%s%s选股结果" % (now.strftime("%m%d"), SLOT_NAME[slot])
+    summary = push_title(slot, now)
     return push(msg, summary)
 
 
