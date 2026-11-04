@@ -104,47 +104,92 @@ def fetch_snapshot_sina_market(pages=60, log=print):
     return df
 
 
-def fetch_snapshot(fallback_codes=None, log=print):
-    """全市场快照，返回 DataFrame（成交量单位：手，成交额单位：元）。"""
-    rows = []
-    for host in SNAP_HOSTS:
-        rows = []
-        try:
-            page = 1
-            while page <= 10:
-                js = _get(host, {"pn": page, "pz": 1000, "po": 1, "np": 1,
-                                 "fltt": 2, "invt": 2, "fid": "f12",
-                                 "fs": FS, "fields": FIELDS})
-                data = js.get("data") or {}
-                diff = data.get("diff") or []
-                if isinstance(diff, dict):
-                    diff = list(diff.values())
-                if not diff:
-                    break
-                rows.extend(diff)
-                total = data.get("total") or 0
-                if total and len(rows) >= total:
-                    break
-                page += 1
-            if rows:
+def _em_snapshot(host, log=print):
+    """东财全市场快照分页（2026-11-04 修复）：
+    接口实际每页固定返回 100 条，`pz=1000` 被服务端忽略，因此按 100 条/页翻页，
+    一直拉到 `total` 满额或连续两页空；旧实现最多 10 页（且常在第 7 页中断），
+    导致只扫到 605xxx-689xxx 段 618 只（覆盖 12%）——所有时段选股都受影响。
+    返回 (rows, total)。"""
+    rows, total, page, empty = [], 0, 1, 0
+    while page <= 80:                      # 80 页 × 100 = 8000，足够全市场
+        js = _get(host, {"pn": page, "pz": 100, "po": 1, "np": 1,
+                         "fltt": 2, "invt": 2, "fid": "f12",
+                         "fs": FS, "fields": FIELDS})
+        data = js.get("data") or {}
+        diff = data.get("diff") or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        if not total:
+            total = int(data.get("total") or 0)
+        if not diff:
+            empty += 1
+            if empty >= 2:                 # 连续两页空 → 认为已拉完
                 break
-        except Exception:
-            rows = []
+            page += 1
             continue
-    if not rows:
+        empty = 0
+        rows.extend(diff)
+        if total and len(rows) >= total:
+            break
+        page += 1
+    return rows, total
+
+
+def fetch_snapshot(fallback_codes=None, log=print, min_coverage=0.70):
+    """全市场快照，返回 DataFrame（成交量单位：手，成交额单位：元）。
+    覆盖校验：东财结果不足全市场 min_coverage 时自动切新浪全市场列表源；
+    两个源都不足则抛错，避免静默用残缺名单进入选股/推送。"""
+    expect = len(set(fallback_codes)) if fallback_codes else 0
+    total = 0
+    best = None
+    for host in SNAP_HOSTS:
+        try:
+            rows, total = _em_snapshot(host)
+        except Exception:
+            continue
+        if not rows:
+            continue
+        df = _snapshot_frame(rows)
+        if best is None or len(df) > len(best):
+            best = df
+        denom = total or expect
+        if denom and len(df) >= denom * min_coverage:
+            break                          # 覆盖达标，直接使用
+    if best is None:
         log("东方财富快照失败，切换新浪全市场列表源…")
+    else:
+        denom = total or expect
+        if not denom or len(best) < denom * min_coverage:
+            log("警告：东方财富快照仅 %d 只（全市场 %s 只，覆盖 %.0f%%），切换新浪全市场列表源…"
+                % (len(best), denom or "未知",
+                   len(best) / denom * 100 if denom else 0))
+            best = None
+    if best is None:
         alt = fetch_snapshot_sina_market(log=log)
         if not alt.empty:
+            denom = expect or total
+            if denom and len(alt) < denom * min_coverage:
+                raise RuntimeError("快照覆盖不足：新浪源仅 %d 只（应有 %d 只），拒绝继续"
+                                   % (len(alt), denom))
             return alt
         if not fallback_codes:
             raise RuntimeError("东方财富与新浪列表源均失败，且未提供备用代码列表")
-        return fetch_snapshot_sina(list(fallback_codes))
+        df = fetch_snapshot_sina(list(fallback_codes))
+        if len(df) < expect * min_coverage:
+            raise RuntimeError("快照覆盖不足：新浪批量源仅 %d 只（应有 %d 只），拒绝继续"
+                               % (len(df), expect))
+        return df
+    return best
+
+
+def _snapshot_frame(rows):
     df = pd.DataFrame(rows).rename(columns=RENAME)
     for c in ["price", "pct", "volume", "amount", "turnover", "vol_ratio",
               "high", "low", "open", "prev_close", "total_mv", "circ_mv"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df["code"] = df["code"].astype(str).str.zfill(6)
+    df = df.drop_duplicates(subset="code")
     df = df[df.apply(lambda r: keep_code(r["code"], r["name"]), axis=1)].copy()
     return df.reset_index(drop=True)
 

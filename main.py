@@ -30,7 +30,9 @@ SLOT_NAME = {"auction": "早盘", "tail": "尾盘", "close": "盘后"}
 SLOT_TIP = {
     "auction": "9:30 开盘后 1-3 分钟内买入，不挂低价等回踩；止损：J1 开盘价-1.5%，J2 昨日最低，J3 -3%。",
     "tail": "14:45 后确认股价在分时均价线上方再买；W1 隔夜，次日冲高 +3%~+5% 分批；W3 打板以涨停价挂单，14:57 未封板放弃。",
-    "close": "F13 盘后收盘确认信号，次日开盘买入，持 10 个交易日；不设止盈止损（回测：任何 TP/SL 都显著降低收益），按市值升序取前 3，弱市月可能连续亏损，属行情依赖型策略。",
+    "close": "F13 盘后收盘确认信号，次日开盘买入，持 10 个交易日；不设止盈止损（回测：任何 TP/SL 都显著降低收益）。"
+             "执行提示：次日开盘涨幅 >+2% 建议放弃或限价等待（回测次日开盘/信号日收盘滑点均 -0.37%、中位 -0.20%，"
+             "但 p95 高开 +9.14%，尾部追高风险大）；弱市月可能连续亏损，属行情依赖型策略。",
 }
 
 # 推送规则（2026-11-02 起）：总量 ≤9，每策略 ≤3，不限板块
@@ -321,13 +323,19 @@ def screen(slot, hist, basic, snap):
 
 
 # ------------------------------------------------------------------ 推送
-def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None):
+def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None,
+                  universe=0):
     now = now_cn()
     per_strategy = per_strategy or {}
-    lines = ["信号 %s｜扫描 %d 只｜候选 %d 只｜输出 %d 只%s"
-             % (now.strftime("%H:%M:%S"), scanned, n_cands, len(picked),
+    cover = ("｜扫描 %d 只（占全市场 %d%%）" % (scanned, round(scanned * 100.0 / universe))
+             if universe else "｜扫描 %d 只" % scanned)
+    warn = ("" if not universe or scanned >= universe * 0.9 else
+            "\n⚠ 数据源覆盖不足：本次仅扫到全市场 %d%%，名单可能漏选，请核对数据源。\n"
+            % round(scanned * 100.0 / universe))
+    lines = ["信号 %s%s｜候选 %d 只｜输出 %d 只%s"
+             % (now.strftime("%H:%M:%S"), cover, n_cands, len(picked),
                 "｜**延迟启动**" if late else ""),
-             "历史数据截至 %s" % meta.get("last_date", "未知"), ""]
+             "历史数据截至 %s%s" % (meta.get("last_date", "未知"), warn), ""]
     if not picked:
         lines += ["今日无信号。严格阈值下 0 只属于正常现象，不要为凑数放宽条件。", ""]
     base_key = "open" if slot == "auction" else "price"
@@ -479,7 +487,8 @@ def main():
         log("  %d. %s %s【%s·第%d】%s" % (h["rank"], h["code"], h["name"], h["sid"],
                                         h["rank"], sector))
 
-    msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy)
+    msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy,
+                        universe=len(basic))
     if args.json_out:
         try:
             import excel_log
