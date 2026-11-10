@@ -16,6 +16,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from openpyxl.styles import PatternFill
 
 import main as M
 
@@ -42,6 +43,12 @@ SLOT_TEXT = {"auction": "竞价", "tail": "尾盘", "close": "盘后"}
 SOURCE_TEXT = {"local": "TC 本机", "cloud": "TC 云端"}
 SOURCE_BOTH = "TC 本机+云端"
 SOURCE_LEGACY = "Trae CN"
+
+# 「采纳」列（每日选股/精选池/优中选优 第 19 列，原「备注」列）：
+# 只给当日该时段“买入清单唯一”的那只票打标，并对该单元格涂金色底。
+# 备注文本统一写第 25 列（Y，表头「备注」）；分析表没有「采纳」列，按表头名取值会自然忽略。
+ADOPT_TEXT = "采纳"
+ADOPT_FILL = PatternFill(fill_type="solid", start_color="FFFFD700", end_color="FFFFD700")
 
 
 def _slot_text(slot):
@@ -112,7 +119,7 @@ def _common(h, slot, date_str, snap_map, source_text=SOURCE_LEGACY):
         "推荐理由": reason,
         "来源": source_text,
         "备注": "",
-        "备注.1": "",
+        "采纳": "",
     }
 
 
@@ -154,6 +161,8 @@ def _write_rows(ws, rows, log):
                 v = _code_text(v)
                 cell.number_format = "@"
             cell.value = v
+            if v == ADOPT_TEXT and str(header[j - 1]).strip() == "采纳":
+                cell.fill = ADOPT_FILL
     if rows:
         log("  %s +%d 行（自第 %d 行）" % (ws.title, len(rows), start))
     return len(rows)
@@ -294,6 +303,8 @@ def build_payload(slot, picked, snap, now=None, source=None):
         if best["rank"] >= 2:
             note += "；优先从排名 2、3 中选取"
         common[best["code"]]["备注"] = note
+        # “买入清单唯一”：该时段只有这一只票打「采纳」标记（S 列金色底）
+        common[best["code"]]["采纳"] = ADOPT_TEXT
 
     best_code = best["code"] if best else ""
     analysis = []
