@@ -26,6 +26,20 @@ META_PATH = os.path.join(DATA_DIR, "meta.json")
 
 TARGET = {"auction": "09:25:05", "tail": "14:40:30", "close": "15:40:30"}
 MINUTES = {"auction": 1, "tail": 220, "close": 240}
+
+# 交易时段闸门（北京时间 HHMM）：窗口外一律不选股、不推送、不写结果、不回填。
+# 2026-11-10 加：GitHub schedule 会把 cron 触发推迟 8~16 小时，凌晨 00:48 / 01:44 两次
+# 被 auto_slot 当成"盘后"执行并推送了 20261110 的 F13（内容是 11-09 收盘旧价）。
+# 盘后窗口取 15:20-17:00，覆盖 cron 15:35 触发 + 观测到的最多 18 分钟迟到。
+SLOT_WINDOW = {"auction": (855, 1130), "tail": (1300, 1500), "close": (1520, 1700)}
+# 深夜禁区：显式 --slot 也会被拦（22:00-07:00）。这是本次事故的直接窗口，只保留这一条底线，
+# 便于人工在盘后到 22 点前补跑；auto 则由 SLOT_WINDOW 全天候拦截。
+NIGHT = (2200, 700)
+# 等待窗口：距目标超过 15 分钟（cron 设计为提前 10 分钟触发，留 5 分钟余量）视为"不是本次触发"，
+# 直接放弃；晚于目标超过 30 分钟视为信号价失效，同样放弃。workflow job timeout 30 分钟，不能睡更久。
+MAX_EARLY = 900
+MAX_LATE = 1800
+ABORT = "abort"
 SLOT_NAME = {"auction": "早盘", "tail": "尾盘", "close": "盘后"}
 SLOT_TIP = {
     "auction": "9:30 开盘后 1-3 分钟内买入，不挂低价等回踩；止损：J1 开盘价-1.5%，J2 昨日最低，J3 -3%。",
@@ -85,29 +99,57 @@ def _n(x, default=0.0):
 
 
 def auto_slot(now):
+    """按北京时间判定时段；不在任何选股窗口内返回 None（调用方据此静默退出）。"""
     hm = now.hour * 100 + now.minute
-    if 855 <= hm <= 1130:
-        return "auction"
-    if 1300 <= hm <= 1500:
-        return "tail"
-    return "close"
+    for slot, (lo, hi) in SLOT_WINDOW.items():
+        if lo <= hm <= hi:
+            return slot
+    return None
 
 
-def wait_for(slot, enabled=True):
+def in_night(now):
+    """深夜禁区判定（含跨零点的 22:00-07:00）。"""
+    hm = now.hour * 100 + now.minute
+    return hm >= NIGHT[0] or hm < NIGHT[1]
+
+
+def wait_for(slot, enabled=True, strict=True):
+    """等到本次时段的目标时刻。
+
+    strict=True（auto 自动判定）时，早于目标 >15 分钟或晚于 >30 分钟直接放弃；
+    strict=False（人工显式 --slot）时只按当前时间执行，仅记日志不放弃。
+    返回 True = 已迟到（结果可能偏离信号价）/ False = 正常 / ABORT = 超出等待窗口，调用方必须放弃。
+    """
     target = TARGET[slot]
     hh, mm, ss = [int(x) for x in target.split(":")]
     now = now_cn()
     tgt = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
     delta = (tgt - now).total_seconds()
+    if delta > MAX_EARLY:
+        if strict:
+            log("当前 %s，距目标 %s 还有 %.1f 小时，超出等待窗口（%d 分钟），"
+                "放弃本次执行：不选股、不推送、不写结果。"
+                % (now.strftime("%H:%M:%S"), target, delta / 3600.0, MAX_EARLY // 60))
+            return ABORT
+        log("当前 %s，距目标 %s 还有 %.1f 小时，不等待，按当前时间直接执行（显式指定时段）"
+            % (now.strftime("%H:%M:%S"), target, delta / 3600.0))
+        return False
     if delta > 0:
         if not enabled:
             log("跳过等待（--no-wait），当前 %s，目标 %s" % (now.strftime("%H:%M:%S"), target))
             return False
         log("等待至 %s（%.0f 秒）" % (target, delta))
-        if delta > 900:
-            log("警告：距目标超过 15 分钟，可能不是交易时段")
-        time.sleep(min(delta, 900))
+        time.sleep(delta)
         return False
+    if -delta > MAX_LATE:
+        if strict:
+            log("当前 %s，已晚于目标 %s 共 %.0f 分钟，超出容忍窗口（%d 分钟），"
+                "放弃本次执行：不选股、不推送、不写结果。"
+                % (now.strftime("%H:%M:%S"), target, -delta / 60.0, MAX_LATE // 60))
+            return ABORT
+        log("已晚于目标 %s 共 %.0f 分钟，仍按当前时间执行（显式指定时段）"
+            % (target, -delta / 60.0))
+        return True
     late = -delta
     if late > 120:
         log("警告：启动已晚于目标 %.0f 秒，结果可能偏离信号价" % late)
@@ -442,9 +484,21 @@ def main():
     args = ap.parse_args()
 
     now = now_cn()
-    slot = auto_slot(now) if args.slot == "auto" else args.slot
+    auto = args.slot == "auto"
+    slot = auto_slot(now) if auto else args.slot
     if slot == "update-history":
         update_history(args.max_codes)
+        return 0
+    if slot is None:
+        log("当前 %s 不在任何选股时段（竞价 08:55-11:30 / 尾盘 13:00-15:00 / "
+            "盘后 15:20-17:00），本次不选股、不推送、不写结果。"
+            "（云端定时任务被 GitHub 调度延迟到非交易时段时属预期行为。）"
+            % now.strftime("%Y-%m-%d %H:%M:%S"))
+        return 0
+    if not auto and in_night(now):
+        log("当前 %s 处于深夜禁区（22:00-07:00），--slot %s 也不放行："
+            "不选股、不推送、不写结果。补跑请等到 07:00 之后。"
+            % (now.strftime("%Y-%m-%d %H:%M:%S"), slot))
         return 0
     if not any(cfg["slot"] == slot for cfg in STRATEGIES.values()):
         log("%s时段无注册策略，跳过选股/推送/回填；历史与日线数据更新不受影响。"
@@ -462,7 +516,10 @@ def main():
         if oldest >= 3:
             log("警告：历史数据最新为 %s，早于预期 %s，请先跑 update-history" % (last, exp))
 
-    late = wait_for(slot, enabled=not args.no_wait)
+    late = wait_for(slot, enabled=not args.no_wait, strict=auto)
+    if late == ABORT:
+        log("本次执行已放弃（超出等待窗口），不选股、不推送、不写结果。")
+        return 0
 
     hist = load_hist()
     if slot == "close" and hist:
