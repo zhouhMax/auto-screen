@@ -3,10 +3,20 @@ name: 每日选股推送
 on:
   schedule:
     # GitHub cron 使用 UTC；北京时间 = UTC+8
-    # 提前 10 分钟触发，脚本内部等到 09:25:05 / 14:40:30 / 15:40:30 再抓数据
+    # 每个时段三个触发点：
+    #   第 1 个提前 10 分钟触发，脚本内部等到 09:25:05 / 14:40:30 / 15:40:30 再抓快照；
+    #   第 2、3 个是兜底（目标 +5 / +10 分钟）。GitHub schedule 实测会延迟 8~16 小时、
+    #   偶尔直接丢失，等待型 run 没起来时靠兜底补；等待型准时跑完后，兜底 run 会看到
+    #   data/results/<日期>_<时段>.json 已存在并 exit 0（不选股、不推送）。
     - cron: "15 1 * * 1-5"    # 09:15 -> 等待 09:25 竞价
+    - cron: "30 1 * * 1-5"    # 09:30 -> 竞价兜底（目标 +5 分钟）
+    - cron: "35 1 * * 1-5"    # 09:35 -> 竞价兜底（目标 +10 分钟）
     - cron: "35 6 * * 1-5"    # 14:35 -> 等待 14:40 尾盘
+    - cron: "45 6 * * 1-5"    # 14:45 -> 尾盘兜底（目标 +5 分钟）
+    - cron: "50 6 * * 1-5"    # 14:50 -> 尾盘兜底（目标 +10 分钟）
     - cron: "35 7 * * 1-5"    # 15:35 -> 等待 15:40 盘后
+    - cron: "45 7 * * 1-5"    # 15:45 -> 盘后兜底（目标 +5 分钟）
+    - cron: "50 7 * * 1-5"    # 15:50 -> 盘后兜底（目标 +10 分钟）
   workflow_dispatch:
     inputs:
       slot:
@@ -17,7 +27,11 @@ on:
         options: [auction, tail, close]
 
 concurrency:
-  group: screen-${{ github.ref }}
+  # 按“时段”而不是按“触发点”隔离：同一时段只允许一个 run 在跑，杜绝两个 run 同时
+  # 拉快照、同时推送（同一 group 同时只能 running 1 个 + pending 1 个，新的 pending
+  # 会顶掉旧的 pending，所以 3 个触发点实际最多跑 2 个：等待型 + 最新兜底）。
+  # 不同时段组名不同，互不阻塞。手动触发按 inputs.slot 归组，与同名 cron 串行。
+  group: screen-${{ github.ref }}-${{ github.event.inputs.slot || (contains(github.event.schedule || '', ' 1 * * 1-5') && 'auction') || (contains(github.event.schedule || '', ' 6 * * 1-5') && 'tail') || (contains(github.event.schedule || '', ' 7 * * 1-5') && 'close') || 'other' }}
   cancel-in-progress: false
 
 permissions:
@@ -28,7 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # fetch-depth: 0：兜底推送需要 rebase 到最新 origin/main，浅克隆会让 rebase 失败
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -57,6 +74,7 @@ jobs:
               print(json.load(open("data/meta.json", encoding="utf-8")))
           PY
 
+      # 幂等判断在 main.py 里、拉快照之前：该日该时段已有完整结果（本地或远端）就直接 exit 0
       - name: 运行选股并推送
         env:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
@@ -64,10 +82,44 @@ jobs:
           WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
         run: python main.py --slot "${{ github.event.inputs.slot || 'auto' }}" --json-out
 
+      # 提交结果标记到仓库，供本机 sync_cloud.py 拉到、也供本机选股前判断“云端已推送”。
+      # 冲突策略：先到者为准——远端已有同名结果时丢弃本地这份，不覆盖、不 rebase 冲突。
       - name: 提交结果到仓库
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          drop_dup() {
+            git fetch origin main --quiet
+            for f in $(git ls-files -mo --exclude-standard -- data/results); do
+              if git cat-file -e "origin/main:$f" 2>/dev/null; then
+                echo "远端已有 $f（先到者为准），丢弃本次产出"
+                if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                  git checkout HEAD -- "$f"
+                else
+                  rm -f "$f"
+                fi
+              fi
+            done
+          }
+
+          drop_dup
           git add data/results
-          git diff --cached --quiet || git commit -m "选股结果 $(date -u +'%Y%m%d %H:%M') UTC"
-          git push
+          if git diff --cached --quiet; then
+            echo "没有新结果需要提交"
+            exit 0
+          fi
+          git commit -m "选股结果 $(date -u +'%Y%m%d %H:%M') UTC"
+          for i in 1 2 3; do
+            if git push; then
+              echo "结果标记已推送"
+              exit 0
+            fi
+            echo "push 被拒（第 $i 次），同步远端后重试"
+            git fetch origin main --quiet
+            git pull --rebase --autostash -X ours origin main || { git rebase --abort; exit 1; }
+            sleep 3
+          done
+          echo "结果标记推送失败：远端没有本次标记，后续触发可能重复推送"
+          exit 1

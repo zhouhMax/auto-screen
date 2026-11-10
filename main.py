@@ -9,6 +9,7 @@ import json
 import time
 import argparse
 import datetime as dt
+import subprocess
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -19,10 +20,12 @@ import boards
 from strategies import STRATEGIES
 
 CN = ZoneInfo("Asia/Shanghai")
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 HIST_PATH = os.path.join(DATA_DIR, "hist.parquet")
 BASIC_PATH = os.path.join(DATA_DIR, "basic.parquet")
 META_PATH = os.path.join(DATA_DIR, "meta.json")
+RESULT_DIR = os.path.join(DATA_DIR, "results")
 
 TARGET = {"auction": "09:25:05", "tail": "14:40:30", "close": "15:40:30"}
 MINUTES = {"auction": 1, "tail": 220, "close": 240}
@@ -30,8 +33,17 @@ MINUTES = {"auction": 1, "tail": 220, "close": 240}
 # 交易时段闸门（北京时间 HHMM）：窗口外一律不选股、不推送、不写结果、不回填。
 # 2026-11-10 加：GitHub schedule 会把 cron 触发推迟 8~16 小时，凌晨 00:48 / 01:44 两次
 # 被 auto_slot 当成"盘后"执行并推送了 20261110 的 F13（内容是 11-09 收盘旧价）。
-# 盘后窗口取 15:20-17:00，覆盖 cron 15:35 触发 + 观测到的最多 18 分钟迟到。
-SLOT_WINDOW = {"auction": (855, 1130), "tail": (1300, 1500), "close": (1520, 1700)}
+# 2026-11-10 收窄：窗口只保留目标时刻附近"信号价还有意义"的一段，越界直接不进入流程。
+#   竞价 08:55-09:40（目标 09:25:05）：09:15/09:30/09:35 三个触发点都在窗口内；
+#        09:40 之后集合竞价的委托已成交，再用当时的价当"竞价价"会给错误信号价。
+#   尾盘 14:20-15:10（目标 14:40:30）：尾盘语义只覆盖"收盘前约 30 分钟"；14:20 之前
+#        的涨幅/量比不代表尾盘状态，15:10 后当日已收盘，尾盘单也无从下。
+#   盘后 15:20-16:10（目标 15:40:30）：收盘后 20 分钟数据才稳定；16:10 之后离开盘
+#        太久，F13 的"次日开盘买入"已没有可操作余地。
+# 注意：窗口只约束 auto（云端定时）；显式 --slot 只受 NIGHT（22:00-07:00）约束，
+#      本机补跑不受影响。窗口前段仍会再被 wait_for 的 MAX_EARLY 拦一次（早于目标
+#      15 分钟以上直接放弃），所以窗口前端主要起"语义边界 + 日志自洽"的作用。
+SLOT_WINDOW = {"auction": (855, 940), "tail": (1420, 1510), "close": (1520, 1610)}
 # 深夜禁区：显式 --slot 也会被拦（22:00-07:00）。这是本次事故的直接窗口，只保留这一条底线，
 # 便于人工在盘后到 22 点前补跑；auto 则由 SLOT_WINDOW 全天候拦截。
 NIGHT = (2200, 700)
@@ -155,6 +167,162 @@ def wait_for(slot, enabled=True, strict=True):
         log("警告：启动已晚于目标 %.0f 秒，结果可能偏离信号价" % late)
         return True
     return False
+
+
+# ------------------------------------------------------------------ 幂等 / 跨端去重
+# 标记 = data/results/<日期>_<时段>.json 本身。存在且结构完整（status=ok、日期时段对得上、
+# 每日选股是列表）⇒ 该日该时段"已成功产出并推送"，后续触发直接 exit 0。
+# 只看"文件存在"会把上次失败留下的半成品（写一半、编码错、字段缺）当成成功，所以必须解析。
+GIT = r"D:\Program Files\Git\cmd\git.exe"
+REMOTES = ("origin", "ssh")
+
+
+def result_name(slot, now=None):
+    now = now or now_cn()
+    return "%s_%s.json" % (now.strftime("%Y%m%d"), slot)
+
+
+def parse_result(text):
+    """解析结果 JSON；只有结构完整才返回 payload，否则返回 None（视为未成功/半成品）。"""
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "ok":         # 2026-11-10 之前写的老文件没有 status，按未产处理
+        return None
+    if not payload.get("date") or not payload.get("slot"):
+        return None
+    if payload.get("slot") not in TARGET:
+        return None
+    sheets = payload.get("sheets")
+    if not isinstance(sheets, dict):
+        return None
+    if not isinstance(sheets.get("每日选股"), list):
+        return None
+    return payload
+
+
+def load_result(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return parse_result(f.read())
+    except Exception:
+        return None
+
+
+def _git(args, timeout=90):
+    exe = GIT if os.path.exists(GIT) else "git"
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")   # 不弹交互式账号密码，避免卡住选股
+    try:
+        p = subprocess.run([exe] + list(args), cwd=BASE_DIR, capture_output=True, env=env,
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode == 0, ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def remote_result(name):
+    """从远端（origin→ssh）取 data/results/<name>。
+
+    返回 (状态, payload)：'ok' 已成功产出 / 'absent' 不存在或内容损坏 /
+    'unknown' 无法确认（fetch 失败，网络/鉴权问题）——调用方按未产出继续，并记警告。
+    """
+    rel = "data/results/%s" % name
+    for remote in REMOTES:
+        ok, _ = _git(["fetch", remote, "main", "--quiet"], timeout=25)
+        if not ok:
+            continue
+        ok, text = _git(["show", "FETCH_HEAD:%s" % rel], timeout=30)
+        if ok:
+            payload = parse_result(text)
+            if payload:
+                return "ok", payload
+            return "absent", None             # 文件在但内容损坏/半成品 → 允许重做
+        return "absent", None                 # fetch 成功但没有该文件
+    return "unknown", None
+
+
+def check_done(slot, log=log):
+    """该日该时段是否已成功产出；是则返回 payload，否则 None。"""
+    name = result_name(slot)
+    path = os.path.join(RESULT_DIR, name)
+    if os.path.exists(path):
+        payload = load_result(path)
+        if payload and payload.get("slot") == slot:
+            return payload
+        log("本地 %s 存在但内容不完整或时段不符（失败遗留/半成品），按未产出处理并覆盖重做"
+            % name)
+    st, payload = remote_result(name)
+    if st == "ok" and payload and payload.get("slot") == slot:
+        log("远端已有 %s，视为另一端已成功产出" % name)
+        return payload
+    if st == "unknown":
+        log("警告：无法确认远端是否已产出（git fetch 失败），按未产出继续；"
+            "若另一端同时成功会产生重复推送")
+    return None
+
+
+def write_result(payload, log=log):
+    """原子写入结果标记（先写 .tmp 再 replace，避免留下半成品）。返回路径。"""
+    path = os.path.join(RESULT_DIR, "%s_%s.json" % (payload["date"], payload["slot"]))
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+    return path
+
+
+def publish_result(path, log=log):
+    """本机把标记提交并推到远端，供云端下次触发时跳过（先到者为准：远端已有则不覆盖）。"""
+    rel = os.path.relpath(path, BASE_DIR).replace(os.sep, "/")
+    for remote in REMOTES:
+        ok, _ = _git(["fetch", remote, "main", "--quiet"])
+        if not ok:
+            continue
+        has, _ = _git(["cat-file", "-e", "FETCH_HEAD:%s" % rel], timeout=20)
+        if has:
+            log("远端（%s）已存在 %s，以先到者为准，不提交本机结果" % (remote, rel))
+            return False
+        ok, out = _git(["add", "--", rel])
+        if not ok:
+            log("标记入库失败：%s" % out)
+            return False
+        ok, out = _git(["commit", "-m", "本机选股结果 %s" % os.path.basename(rel), "--", rel])
+        if not ok:
+            log("标记提交失败（可能无改动）：%s" % out)
+            return False
+        for _ in range(2):
+            ok, out = _git(["push", remote, "HEAD:main"], timeout=180)
+            if ok:
+                log("标记已推送到 %s：%s" % (remote, rel))
+                return True
+            log("标记推送失败，重试：%s" % out)
+            _git(["fetch", remote, "main", "--quiet"])
+        return False
+    log("警告：无法推送本机结果标记（远端不可达），云端可能重复推送")
+    return False
+
+
+def finish_existing(payload, slot, args, log=log):
+    """该日该时段已成功产出：不选股、不推送；本机 --excel 时把既有结果采纳进表格。
+
+    Excel 侧按（日期, 时段, 代码）去重，重复采纳是幂等的；采纳的是"先到者"那份名单，
+    因此两端选股结果不同时，后到的一侧不会把自己那份写进同一天同一时段。
+    """
+    n = len(payload.get("sheets", {}).get("每日选股") or [])
+    log("幂等跳过：%s_%s.json 已成功产出（%d 只，来源 %s），本次不选股、不推送。"
+        % (payload.get("date"), slot, n, payload.get("source", "未知")))
+    if args.excel and not args.dry_run:
+        try:
+            import excel_log
+            excel_log.write_payload(payload, log)
+            log("已把既有结果采纳进 Excel（按 日期+时段+代码 去重，不会重复写入）")
+        except Exception as e:
+            log("Excel 采纳既有结果失败：%s" % e)
+    return 0
 
 
 def load_hist():
@@ -481,6 +649,8 @@ def main():
                     help="把结果回填到选股池-TR.xlsx（每日选股/精选池/优中选优/分析）")
     ap.add_argument("--json-out", action="store_true",
                     help="把结果写入 data/results/<日期>_<时段>.json，供云端提交后本地回填")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略幂等标记强制重跑（用于当天结果有问题时人工补跑）")
     args = ap.parse_args()
 
     now = now_cn()
@@ -490,8 +660,8 @@ def main():
         update_history(args.max_codes)
         return 0
     if slot is None:
-        log("当前 %s 不在任何选股时段（竞价 08:55-11:30 / 尾盘 13:00-15:00 / "
-            "盘后 15:20-17:00），本次不选股、不推送、不写结果。"
+        log("当前 %s 不在任何选股时段（竞价 08:55-09:40 / 尾盘 14:20-15:10 / "
+            "盘后 15:20-16:10），本次不选股、不推送、不写结果。"
             "（云端定时任务被 GitHub 调度延迟到非交易时段时属预期行为。）"
             % now.strftime("%Y-%m-%d %H:%M:%S"))
         return 0
@@ -504,6 +674,13 @@ def main():
         log("%s时段无注册策略，跳过选股/推送/回填；历史与日线数据更新不受影响。"
             % SLOT_NAME.get(slot, slot))
         return 0
+
+    # 幂等闸门 #1：必须在 load_hist / 拉快照之前，避免无谓计算与重复推送。
+    # 多点触发后同一天同一时段会有多个 run，第一个成功产出后其余全部走这里退出。
+    if not args.force:
+        done = check_done(slot)
+        if done:
+            return finish_existing(done, slot, args)
 
     meta = {}
     if os.path.exists(META_PATH):
@@ -520,6 +697,13 @@ def main():
     if late == ABORT:
         log("本次执行已放弃（超出等待窗口），不选股、不推送、不写结果。")
         return 0
+    now = now_cn()
+
+    # 幂等闸门 #2：等待期间另一端（云端/本机）可能已经产出并推送，复查一次再拉快照。
+    if not args.force:
+        done = check_done(slot)
+        if done:
+            return finish_existing(done, slot, args)
 
     hist = load_hist()
     if slot == "close" and hist:
@@ -564,19 +748,20 @@ def main():
 
     msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy,
                         universe=len(basic))
-    if args.json_out:
+    marker = None
+    if (args.json_out or args.excel) and not args.dry_run:
         try:
             import excel_log
             payload = excel_log.build_payload(slot, picked, snap, now)
-            out_dir = os.path.join(DATA_DIR, "results")
-            os.makedirs(out_dir, exist_ok=True)
-            path = os.path.join(out_dir, "%s_%s.json" % (payload["date"], slot))
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, default=str)
-            log("结果已写入 %s" % path)
+            # 幂等标记只认 status=ok 的完整文件；老版本没有 status，按未产处理
+            payload["status"] = "ok"
+            payload["source"] = "cloud" if args.json_out else "local"
+            payload["pushed_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            marker = write_result(payload)
+            log("结果标记已写入 %s（%d 只）" % (marker, len(picked)))
         except Exception as e:
             log("结果 JSON 写入失败：%s" % e)
-    if args.excel:
+    if args.excel and not args.dry_run:
         try:
             import excel_log
             excel_log.write(slot, picked, snap, hist, now, log)
@@ -586,7 +771,12 @@ def main():
         log(msg)
         return 0
     summary = push_title(slot, now)
-    return push(msg, summary)
+    rc = push(msg, summary)
+    # 本机通道没有 workflow 帮忙提交，自己把标记推到远端，云端下次触发时据此跳过。
+    # 只在推送成功后发布：推送失败宁可让后续触发重做，也不要把"没发出去"记成"已发过"。
+    if rc == 0 and marker and not args.json_out:
+        publish_result(marker)
+    return rc
 
 
 if __name__ == "__main__":
