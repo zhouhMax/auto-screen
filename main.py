@@ -581,8 +581,8 @@ def build_message(slot, picked, scanned, n_cands, late, meta, per_strategy=None,
             pct = (float(h["price"]) / float(h["prev_close"]) - 1) * 100
         mv = h.get("circ_mv") or h.get("mv") or 0
         sec = h.get("industry") or "未分类"
-        lines.append("%d｜%s %s｜%s｜流通市值%s｜收 %.2f｜%s｜%.2f-%.2f｜%s" % (
-            i + 1, h["name"], h["code"], sec,
+        lines.append("%d｜%s %s｜%s｜%s %s｜流通市值%s｜收 %.2f｜%s｜%.2f-%.2f｜%s" % (
+            i + 1, h["name"], h["code"], sec, sid, STRATEGIES[sid]["name"],
             ("%.1f亿" % (float(mv) / 1e8)) if float(mv) > 1e7 else "—",
             float(h["price"]), ("%+.2f%%" % float(pct)) if pct is not None else "—",
             lo, hi, RANK_TEXT.get(h["rank"], "谨慎推荐")))
