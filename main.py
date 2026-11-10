@@ -769,14 +769,14 @@ def main():
 
     msg = build_message(slot, picked, scanned, n_cands, late, meta, per_strategy,
                         universe=len(basic))
+    src = "cloud" if args.json_out else "local"
     marker = None
     if (args.json_out or args.excel) and not args.dry_run:
         try:
             import excel_log
-            payload = excel_log.build_payload(slot, picked, snap, now)
+            payload = excel_log.build_payload(slot, picked, snap, now, source=src)
             # 幂等标记只认 status=ok 的完整文件；老版本没有 status，按未产处理
             payload["status"] = "ok"
-            payload["source"] = "cloud" if args.json_out else "local"
             payload["pushed_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
             marker = write_result(payload)
             log("结果标记已写入 %s（%d 只）" % (marker, len(picked)))
@@ -785,7 +785,7 @@ def main():
     if args.excel and not args.dry_run:
         try:
             import excel_log
-            excel_log.write(slot, picked, snap, hist, now, log)
+            excel_log.write(slot, picked, snap, hist, now, log, source=src)
         except Exception as e:
             log("Excel 回填失败：%s" % e)
     if args.dry_run:

@@ -35,6 +35,14 @@ RET_COLS = [(2, "第2日收盘涨幅"), (3, "第3日收盘涨幅"), (5, "第5日
             (10, "第10日收盘涨幅"), (20, "第20日收盘涨幅")]
 SLOT_TEXT = {"auction": "竞价", "tail": "尾盘", "close": "盘后"}
 
+# “来源”列（每日选股/精选池/优中选优 第 18 列）取值：
+#   TC 本机 / TC 云端  —— 单端产出
+#   TC 本机+云端       —— 同一只票两端都选到（不同快照各写一次，合并标注）
+#   Trae CN            —— 2026-11-10 之前的旧值，来源不可考，按约定不改写
+SOURCE_TEXT = {"local": "TC 本机", "cloud": "TC 云端"}
+SOURCE_BOTH = "TC 本机+云端"
+SOURCE_LEGACY = "Trae CN"
+
 
 def _slot_text(slot):
     return SLOT_TEXT.get(slot, slot)
@@ -70,7 +78,7 @@ def _tpsl_text(sid):
                                            ("%.1f" % sl).rstrip("0").rstrip(".")))
 
 
-def _common(h, slot, date_str, snap_map):
+def _common(h, slot, date_str, snap_map, source_text=SOURCE_LEGACY):
     sid = h["sid"]
     code = h["code"]
     base = _base(h, slot)
@@ -102,7 +110,7 @@ def _common(h, slot, date_str, snap_map):
         "策略内排名": "%s第%d名" % (st, h["rank"]),
         "推荐程度": M.RANK_TEXT.get(h["rank"], "谨慎推荐"),
         "推荐理由": reason,
-        "来源": "Trae CN",
+        "来源": source_text,
         "备注": "",
         "备注.1": "",
     }
@@ -153,20 +161,65 @@ def _write_rows(ws, rows, log):
 
 def _existing(ws):
     """返回已有 (日期, 时段, 代码) 集合，用于去重。"""
+    return set(_index_rows(ws))
+
+
+def _index_rows(ws):
+    """返回 {(日期, 时段, 代码): 行号}，用于去重与来源合并。"""
     header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
     try:
         i_d = header.index("选股日期")
         i_s = header.index("选股时段")
         i_c = header.index("股票代码")
     except ValueError:
-        return set()
-    out = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
+        return {}
+    out = {}
+    for r, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if row[i_d] is None:
             continue
         code = _code_text(row[i_c]) if row[i_c] is not None else ""
-        out.add((str(row[i_d]), str(row[i_s] or ""), code))
+        out[(str(row[i_d]), str(row[i_s] or ""), code)] = r
     return out
+
+
+def _split_source(text):
+    """把来源文本拆成端标签集合，如 "TC 本机+云端" -> ["本机", "云端"]。
+    历史值 Trae CN 无法判断来源，返回 None（不参与合并、不改写）。"""
+    if not text or text == SOURCE_LEGACY:
+        return None
+    parts = []
+    for p in text.split("+"):
+        p = p.strip()
+        if p.startswith("TC "):
+            p = p[3:].strip()
+        elif p == SOURCE_LEGACY:
+            return None
+        if p and p not in parts:
+            parts.append(p)
+    return parts
+
+
+def _merge_source(ws, row_no, new_text, log):
+    """同一只票两端都选到时，把“来源”合并成 TC 本机+云端；其余列（价格等）保持先到的那份。"""
+    header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    if "来源" not in header:
+        return 0
+    cell = ws.cell(row=row_no, column=header.index("来源") + 1)
+    cur = str(cell.value or "").strip()
+    if not cur:
+        cell.value = new_text
+        return 1
+    cur_parts = _split_source(cur)
+    add_parts = _split_source(new_text)
+    if cur_parts is None:
+        # 历史行来源不可考：按约定不改写历史数据，只记录一条日志
+        log("  %s 第 %d 行来源是历史值「%s」，不覆盖（另一端为 %s）"
+            % (ws.title, row_no, cur, new_text))
+        return 0
+    if not add_parts or all(p in cur_parts for p in add_parts):
+        return 0
+    cell.value = "TC " + "+".join(cur_parts + [p for p in add_parts if p not in cur_parts])
+    return 1
 
 
 def _hist_index(hist):
@@ -213,13 +266,17 @@ def fill_returns(wb, hist, log=print):
         log("  回算涨幅 %d 个单元格" % total)
 
 
-def build_payload(slot, picked, snap, now=None):
-    """构造待回填数据；云端 --json 与本地 write 共用同一份结构。"""
+def build_payload(slot, picked, snap, now=None, source=None):
+    """构造待回填数据；云端 --json 与本地 write 共用同一份结构。
+
+    source: "local" 写 TC 本机，"cloud" 写 TC 云端；None（老调用）沿用历史值 Trae CN。
+    """
     now = now or M.now_cn()
     date_str = now.strftime("%Y%m%d")
+    src_text = SOURCE_TEXT.get(source, SOURCE_LEGACY)
     snap_map = snap.set_index("code").to_dict("index") if not snap.empty else {}
 
-    common = {h["code"]: _common(h, slot, date_str, snap_map) for h in picked}
+    common = {h["code"]: _common(h, slot, date_str, snap_map, src_text) for h in picked}
     pool = [h for h in picked if h["rank"] <= 3]   # 每策略前 3 进入精选池
     best = None
     if pool:
@@ -255,18 +312,24 @@ def build_payload(slot, picked, snap, now=None):
         r["是否在优中选优"] = "是" if h["code"] == best_code else "否"
         analysis.append(r)
 
-    return {"date": date_str, "slot": slot, "sheets": {
+    payload = {"date": date_str, "slot": slot, "sheets": {
         SHEET_DAILY: [common[h["code"]] for h in picked],
         SHEET_PICK: [common[h["code"]] for h in pool],
         SHEET_BEST: [common[best["code"]]] if best else [],
         SHEET_ANALYSIS: analysis,
     }}
+    if source:
+        payload["source"] = source
+    return payload
 
 
 def _apply(wb, payload, log):
+    """把一份结果写进各表：按（日期, 时段, 代码）去重，两端名单各自成行，重复的票合并来源。"""
     date_str = str(payload.get("date"))
     slot = payload.get("slot")
+    src_text = SOURCE_TEXT.get(payload.get("source"), SOURCE_LEGACY)
     n = 0
+    merged = 0
     for name in (SHEET_DAILY, SHEET_PICK, SHEET_BEST, SHEET_ANALYSIS):
         rows = (payload.get("sheets") or {}).get(name) or []
         if name not in wb.sheetnames:
@@ -276,10 +339,22 @@ def _apply(wb, payload, log):
             ws.append(COL_ANALYSIS)
             log("  新建工作表：%s" % name)
         ws = wb[name]
-        seen = _existing(ws)
-        keep = [r for r in rows
-                if (date_str, _slot_text(slot), _code_text(r.get("股票代码"))) not in seen]
+        idx = _index_rows(ws)
+        keep, hit = [], []
+        seen = set(idx)
+        for r in rows:
+            key = (date_str, _slot_text(slot), _code_text(r.get("股票代码")))
+            if key in seen:
+                if key in idx:
+                    hit.append(idx[key])
+                continue          # 同一份 payload 内部的重复票也跳过
+            seen.add(key)
+            keep.append(r)
         n += _write_rows(ws, keep, log)
+        for row_no in hit:
+            merged += _merge_source(ws, row_no, src_text, log)
+    if merged:
+        log("  来源标注更新 %d 处（两端都选到的票，价格等其余列保留先到那份）" % merged)
     return n
 
 
@@ -296,13 +371,13 @@ def _save(wb):
             time.sleep(2)
 
 
-def write(slot, picked, snap, hist, now=None, log=print):
-    """回填一次选股结果，返回追加行数。"""
+def write(slot, picked, snap, hist, now=None, log=print, source=None):
+    """回填一次选股结果，返回追加行数。source 决定“来源”列写 TC 本机 还是 TC 云端。"""
     from openpyxl import load_workbook
     if not os.path.exists(LOG_PATH):
         raise RuntimeError("找不到表格：%s" % LOG_PATH)
     wb = load_workbook(LOG_PATH)
-    n = _apply(wb, build_payload(slot, picked, snap, now), log)
+    n = _apply(wb, build_payload(slot, picked, snap, now, source), log)
     fill_returns(wb, hist, log)
     _save(wb)
     log("Excel 回填完成：%s（%d 行）" % (LOG_PATH, n))
@@ -318,6 +393,7 @@ def write_payload(payload, log=print):
     n = _apply(wb, payload, log)
     _save(wb)
     if n:
-        log("云端结果回填：%s %s 时段 %s，%d 行"
-            % (payload.get("date"), payload.get("slot"), LOG_PATH, n))
+        log("%s结果回填：%s %s 时段 %s，%d 行"
+            % (SOURCE_TEXT.get(payload.get("source"), "历史"), payload.get("date"),
+               payload.get("slot"), LOG_PATH, n))
     return n
