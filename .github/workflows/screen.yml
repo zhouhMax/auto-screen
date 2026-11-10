@@ -74,7 +74,8 @@ jobs:
               print(json.load(open("data/meta.json", encoding="utf-8")))
           PY
 
-      # 幂等判断在 main.py 里、拉快照之前：该日该时段已有完整结果（本地或远端）就直接 exit 0
+      # 幂等判断在 main.py 里、拉快照之前：该日该时段已有完整结果（本地或远端）就直接 exit 0。
+      # 推送前还会等 90 秒复查远端（跨端去重），本机已推送过就让位，不多发一条。
       - name: 运行选股并推送
         env:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}

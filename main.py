@@ -175,6 +175,10 @@ def wait_for(slot, enabled=True, strict=True):
 # 只看"文件存在"会把上次失败留下的半成品（写一半、编码错、字段缺）当成成功，所以必须解析。
 GIT = r"D:\Program Files\Git\cmd\git.exe"
 REMOTES = ("origin", "ssh")
+# 跨端去重宽限：云端是备用通道，与本机几乎同时（都在目标时刻）取价。
+# 本机推送约在目标 +40 秒、标记约 +50 秒落到远端；云端推送前多等 90 秒再复查远端，
+# 看到本机标记就让位。本机不等待——它是主通道，推送时点不能被拖后。
+GRACE_PEER = 90
 
 
 def result_name(slot, now=None):
@@ -261,6 +265,23 @@ def check_done(slot, log=log):
     if st == "unknown":
         log("警告：无法确认远端是否已产出（git fetch 失败），按未产出继续；"
             "若另一端同时成功会产生重复推送")
+    return None
+
+
+def peer_published(slot, seconds=0, log=log):
+    """等若干秒后只看**远端**：另一端是否已推送。
+
+    不能复用 check_done：它先看本机文件，会读到本机刚写的标记而误判"另一端已推送"。
+    """
+    if seconds > 0:
+        log("跨端去重宽限：等 %d 秒后复查远端，避免与另一端重复推送" % seconds)
+        time.sleep(seconds)
+    name = result_name(slot)
+    st, payload = remote_result(name)
+    if st == "ok" and payload and payload.get("slot") == slot:
+        return payload
+    if st == "unknown":
+        log("警告：宽限复查失败（git fetch 不通），按“另一端未推送”继续；可能重复推送")
     return None
 
 
@@ -770,6 +791,15 @@ def main():
     if args.dry_run:
         log(msg)
         return 0
+    # 跨端去重：云端（--json-out）是备用通道，与本机几乎同时在目标时刻取价。推送前多等
+    # GRACE_PEER 秒复查远端，本机已经把标记推上去就让位，避免同一天同一时段两条推送。
+    # 本机（--excel）不等待：主通道的推送时点不能被拖后（竞价要在 09:30 前留给用户反应）。
+    if args.json_out and marker:
+        peer = peer_published(slot, GRACE_PEER)
+        if peer:
+            log("宽限期内发现另一端已推送（来源 %s，%d 只），本次不重复推送；"
+                "以先到者名单为准" % (peer.get("source"), len(peer["sheets"].get("每日选股") or [])))
+            return 0
     summary = push_title(slot, now)
     rc = push(msg, summary)
     # 本机通道没有 workflow 帮忙提交，自己把标记推到远端，云端下次触发时据此跳过。
